@@ -1,4 +1,4 @@
-name: Windows 10 RDP Direct (1 Year)
+name: Windows 10 RDP (1 Year)
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
 
 env:
   RDP_USER: "GitHubRDPUser"
-  MAX_RETRIES: 15
+  MAX_RETRIES: 20
   RETRY_DELAY: 10
 
 jobs:
@@ -20,20 +20,13 @@ jobs:
     timeout-minutes: 525600  # 365 days in minutes (1 year)
 
     steps:
-    - name: Check Windows version and network
+    - name: Check Windows version
       run: |
         Write-Host "Windows version:"
         systeminfo | findstr /B /C:"OS Name" /C:"OS Version"
-        Write-Host "Network information:"
-        ipconfig | findstr IPv4
-        Write-Host "Public IP information:"
-        try {
-            $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
-            Write-Host "Public IP: $publicIP"
-            echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-        } catch {
-            Write-Host "Could not retrieve public IP"
-        }
+        Write-Host "Runner information:"
+        echo "Runner name: $env:COMPUTERNAME"
+        echo "User: $env:USERNAME"
 
     - name: Validate and calculate timeout
       run: |
@@ -95,35 +88,21 @@ jobs:
             Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force -ErrorAction Stop
                              
-            Write-Host "Configuring RDP port..."
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "PortNumber" -Value 3389 -Force -ErrorAction Stop
-                             
-            Write-Host "Configuring firewall for public access..."
-            # Remove any existing rules
-            netsh advfirewall firewall delete rule name="RDP-Public-3389" 2>&1 | Out-Null
-            netsh advfirewall firewall delete rule name="RDP-Public-3389-UDP" 2>&1 | Out-Null
+            Write-Host "Configuring firewall..."
+            # Remove any existing rule with the same name to avoid duplication
+            netsh advfirewall firewall delete rule name="GitHub-RDP-365" 2>&1 | Out-Null
             
-            # Allow RDP connections on TCP port 3389
-            netsh advfirewall firewall add rule name="RDP-Public-3389" `
-                dir=in action=allow protocol=TCP localport=3389 `
-                description="RDP Public Access TCP" 2>&1 | Out-Null
-                
-            # Allow RDP connections on UDP port 3389 (for better performance)
-            netsh advfirewall firewall add rule name="RDP-Public-3389-UDP" `
-                dir=in action=allow protocol=UDP localport=3389 `
-                description="RDP Public Access UDP" 2>&1 | Out-Null
+            # Allow RDP connections
+            netsh advfirewall firewall add rule name="GitHub-RDP-365" `
+                dir=in action=allow protocol=TCP localport=3389 2>&1 | Out-Null
             
-            # Restart the Remote Desktop services
-            Write-Host "Restarting RDP services..."
+            # Restart the Remote Desktop service
+            Write-Host "Restarting RDP service..."
             Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
-            Stop-Service -Name UmRdpService -Force -ErrorAction SilentlyContinue
             Start-Service -Name TermService -ErrorAction Stop
-            Start-Service -Name UmRdpService -ErrorAction Stop
             
-            # Set services to auto-start
+            # Also enable and start the service
             Set-Service -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
-            Set-Service -Name UmRdpService -StartupType Automatic -ErrorAction SilentlyContinue
             
             Write-Host "RDP configuration completed successfully"
         } catch {
@@ -144,8 +123,8 @@ jobs:
             # Generate secure password without System.Web dependency
             function Generate-SecurePassword {
                 param(
-                    [int]$Length = 20,
-                    [int]$SpecialChars = 5
+                    [int]$Length = 24,
+                    [int]$SpecialChars = 6
                 )
                 
                 $upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -173,7 +152,7 @@ jobs:
             }
             
             # Generate password
-            $password = Generate-SecurePassword -Length 20 -SpecialChars 5
+            $password = Generate-SecurePassword -Length 24 -SpecialChars 6
             $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
             
             # Create user
@@ -196,7 +175,7 @@ jobs:
             # Try alternative approach with simpler password
             try {
                 Write-Host "Trying alternative user creation method..."
-                $password = "GitHubRDP@" + (Get-Date -Format "yyyyMMddHHmmss")
+                $password = "GitHubRDP365@" + (Get-Date -Format "yyyyMMddHHmmss")
                 $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
                 
                 New-LocalUser -Name $env:RDP_USER -Password $securePassword -AccountNeverExpires
@@ -224,141 +203,176 @@ jobs:
             }
         }
 
-    - name: Get network information
+    - name: Install and configure Tailscale
       run: |
-        Write-Host "Collecting network information..."
-        
-        # Get local IP addresses
-        $localIPs = (ipconfig | findstr IPv4) -replace ".*: " | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' }
-        Write-Host "Local IP addresses:"
-        $localIPs | ForEach-Object { Write-Host "  - $_" }
-        
-        # Get public IP
         try {
-            $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
-            Write-Host "Public IP address: $publicIP"
-            echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-        } catch {
-            Write-Host "Could not retrieve public IP, trying alternative service..."
-            try {
-                $publicIP = Invoke-RestMethod -Uri "https://icanhazip.com" -TimeoutSec 10
-                $publicIP = $publicIP.Trim()
-                Write-Host "Public IP address: $publicIP"
-                echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-            } catch {
-                Write-Host "Failed to get public IP from alternative service"
+            # Check if Tailscale is already installed
+            $tailscaleInstalled = Get-Process -Name "tailscale" -ErrorAction SilentlyContinue
+            if ($tailscaleInstalled) {
+                Write-Host "Tailscale is already running, stopping..."
+                Stop-Process -Name "tailscale" -Force -ErrorAction SilentlyContinue
             }
-        }
-        
-        # Test port 3389 locally
-        Write-Host "Testing local RDP port..."
-        try {
-            $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, 3389)
-            $listener.Start()
-            $portOpen = $true
-            $listener.Stop()
-            Write-Host "Port 3389 is available locally"
+            
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            $installerPath = "$env:TEMP\tailscale.msi"
+            
+            Write-Host "Downloading Tailscale..."
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
+            
+            Write-Host "Installing Tailscale..."
+            $installProcess = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -PassThru -ErrorAction Stop
+            
+            if ($installProcess.ExitCode -ne 0) {
+                Write-Warning "Tailscale installation exited with code: $($installProcess.ExitCode)"
+            }
+            
+            # Clean up installer
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+            
+            # Wait for installation to complete
+            Write-Host "Waiting for Tailscale to install..."
+            Start-Sleep -Seconds 30
+            
+            # Check if Tailscale executable exists
+            $tailscaleExe = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+            if (-not (Test-Path $tailscaleExe)) {
+                Write-Error "Tailscale executable not found at $tailscaleExe"
+                exit 1
+            }
+            
+            # Connect to Tailscale
+            Write-Host "Connecting to Tailscale..."
+            $hostname = "gh-win10-365d-$env:GITHUB_RUN_ID"
+            & $tailscaleExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --reset --accept-routes --accept-dns
+            
+            # Get Tailscale IP with retries
+            $retryCount = 0
+            $tsIP = $null
+            
+            while ($retryCount -lt $env:MAX_RETRIES -and [string]::IsNullOrEmpty($tsIP)) {
+                try {
+                    $tsIP = & $tailscaleExe ip -4 2>&1 | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }
+                    if (-not [string]::IsNullOrEmpty($tsIP)) {
+                        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                        Write-Host "Tailscale IP: $tsIP"
+                        break
+                    }
+                } catch {
+                    # Ignore errors during retries
+                }
+                
+                $retryCount++
+                Write-Host "Waiting for Tailscale IP ($retryCount/$env:MAX_RETRIES)..."
+                Start-Sleep -Seconds $env:RETRY_DELAY
+            }
+            
+            if ([string]::IsNullOrEmpty($tsIP)) {
+                Write-Warning "Failed to get Tailscale IP after $env:MAX_RETRIES attempts"
+                # Try to get IP from status
+                try {
+                    $status = & $tailscaleExe status --json 2>&1 | ConvertFrom-Json
+                    if ($status -and $status.Self -and $status.Self.TailscaleIPs) {
+                        $tsIP = $status.Self.TailscaleIPs[0]
+                        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                        Write-Host "Found Tailscale IP from status: $tsIP"
+                    }
+                } catch {
+                    Write-Warning "Could not get IP from status: $($_.Exception.Message)"
+                }
+            }
+            
+            if ([string]::IsNullOrEmpty($tsIP)) {
+                Write-Error "Completely failed to get Tailscale IP"
+                exit 1
+            }
         } catch {
-            Write-Host "Port 3389 might be in use or blocked"
+            Write-Error "Tailscale setup failed: $($_.Exception.Message)"
+            exit 1
         }
 
-    - name: Verify RDP service
+    - name: Verify RDP connectivity
       run: |
-        Write-Host "Verifying RDP services..."
-        
-        # Check if RDP services are running
-        $termService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-        $umRdpService = Get-Service -Name UmRdpService -ErrorAction SilentlyContinue
-        
-        if ($termService) {
-            Write-Host "TermService status: $($termService.Status)"
-            if ($termService.Status -ne "Running") {
-                Write-Host "Starting TermService..."
-                Start-Service -Name TermService -ErrorAction SilentlyContinue
-            }
-        }
-        
-        if ($umRdpService) {
-            Write-Host "UmRdpService status: $($umRdpService.Status)"
-            if ($umRdpService.Status -ne "Running") {
-                Write-Host "Starting UmRdpService..."
-                Start-Service -Name UmRdpService -ErrorAction SilentlyContinue
-            }
-        }
-        
-        # Check firewall rules
-        Write-Host "Checking firewall rules..."
-        $firewallRules = netsh advfirewall firewall show rule name=all | findstr "RDP-Public"
-        if ($firewallRules) {
-            Write-Host "Firewall rules configured:"
-            $firewallRules | ForEach-Object { Write-Host "  - $_" }
-        } else {
-            Write-Host "No firewall rules found, configuring..."
-            netsh advfirewall firewall add rule name="RDP-Public-3389" dir=in action=allow protocol=TCP localport=3389
-            netsh advfirewall firewall add rule name="RDP-Public-3389-UDP" dir=in action=allow protocol=UDP localport=3389
-        }
-        
-        # Test RDP port locally
-        Write-Host "Testing RDP port locally..."
         try {
-            $tcpClient = New-Object System.Net.Sockets.TcpClient
-            $result = $tcpClient.BeginConnect("127.0.0.1", 3389, $null, $null)
-            $success = $result.AsyncWaitHandle.WaitOne(5000, $true)
+            if ([string]::IsNullOrEmpty($env:TAILSCALE_IP)) {
+                Write-Error "No Tailscale IP available for testing"
+                exit 1
+            }
             
-            if ($success) {
-                $tcpClient.EndConnect($result)
-                $tcpClient.Close()
-                Write-Host "✓ RDP port is open locally"
-            } else {
-                $tcpClient.Close()
-                Write-Host "✗ RDP port is not responding locally"
+            Write-Host "Testing RDP connectivity to $env:TAILSCALE_IP..."
+            
+            $retryCount = 0
+            $connectionSuccessful = $false
+            
+            while ($retryCount -lt $env:MAX_RETRIES -and -not $connectionSuccessful) {
+                try {
+                    # Try multiple methods to test connectivity
+                    $tcpClient = New-Object System.Net.Sockets.TcpClient
+                    $result = $tcpClient.BeginConnect($env:TAILSCALE_IP, 3389, $null, $null)
+                    $success = $result.AsyncWaitHandle.WaitOne(10000, $true)
+                    
+                    if ($success) {
+                        $tcpClient.EndConnect($result)
+                        $tcpClient.Close()
+                        $connectionSuccessful = $true
+                        Write-Host "RDP connection test successful!"
+                        break
+                    } else {
+                        $tcpClient.Close()
+                    }
+                } catch {
+                    # Ignore connection errors during retries
+                }
+                
+                $retryCount++
+                Write-Host "RDP connection test failed, retrying ($retryCount/$env:MAX_RETRIES)..."
+                Start-Sleep -Seconds $env:RETRY_DELAY
+            }
+            
+            if (-not $connectionSuccessful) {
+                Write-Warning "RDP connection test failed after $env:MAX_RETRIES attempts"
+                Write-Host "This might be due to Windows firewall or network configuration."
+                Write-Host "The RDP session might still work despite this test failure."
             }
         } catch {
-            Write-Host "✗ Local RDP test failed: $($_.Exception.Message)"
+            Write-Warning "RDP verification failed: $($_.Exception.Message)"
+            Write-Host "Continuing despite RDP test failure..."
         }
 
     - name: Display connection information
       run: |
         Write-Host "`n=============================================="
-        Write-Host "🎉 RDP DIRECT CONNECTION READY (365 DAYS) 🎉"
+        Write-Host "🎉 RDP CONNECTION READY (365 DAYS) 🎉"
         Write-Host "=============================================="
-        Write-Host "Public IP:   $env:PUBLIC_IP"
-        Write-Host "Port:        3389"
-        Write-Host "Username:    $env:RDP_USER"
-        Write-Host "Password:    $env:RDP_PASSWORD"
+        Write-Host "Address:   $env:TAILSCALE_IP"
+        Write-Host "Username:  $env:RDP_USER"
+        Write-Host "Password:  $env:RDP_PASSWORD"
         Write-Host "=============================================="
-        Write-Host "Duration:    $env:TIMEOUT_DAYS days"
-        Write-Host "Started:     $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        Write-Host "Ends:        $((Get-Date).AddDays($env:TIMEOUT_DAYS).ToString('yyyy-MM-dd HH:mm:ss'))"
+        Write-Host "Duration:  $env:TIMEOUT_DAYS days"
+        Write-Host "Started:   $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Write-Host "Ends:      $(Get-Date).AddDays($env:TIMEOUT_DAYS).ToString('yyyy-MM-dd HH:mm:ss')"
         Write-Host "=============================================="
         
-        # Display local IPs for additional connectivity options
-        Write-Host "`nLocal IP addresses (if needed):"
-        ipconfig | findstr IPv4 | ForEach-Object { 
-            $ip = $_ -replace ".*: "
-            Write-Host "  - $ip:3389"
+        # Display additional network information
+        try {
+            Write-Host "`nNetwork information:"
+            ipconfig | findstr IPv4
+            & "${env:ProgramFiles}\Tailscale\tailscale.exe" status
+        } catch {
+            Write-Host "Could not retrieve additional network information"
         }
         
-        Write-Host "`nConnection string examples:"
-        Write-Host "  - mstsc /v:$env:PUBLIC_IP:3389"
-        Write-Host "  - Remote Desktop Connection -> $env:PUBLIC_IP:3389"
-        
         Write-Host "=============================================="
-        Write-Host "⚠️  IMPORTANT: This RDP is publicly accessible!"
-        Write-Host "Use a strong password and be cautious."
+        Write-Host "This RDP session will remain active for $env:TIMEOUT_DAYS days"
         Write-Host "==============================================`n"
 
-    - name: Maintain RDP connection (1 Year - Direct)
+    - name: Maintain RDP connection (1 Year)
       run: |
-        Write-Host "Starting 1-year RDP maintenance session (Direct Connection)..."
+        Write-Host "Starting 1-year RDP maintenance session..."
         Write-Host "Timeout: $env:TIMEOUT_DAYS days ($env:TIMEOUT_HOURS hours)"
-        Write-Host "Public IP: $env:PUBLIC_IP:3389"
         
         $startTime = Get-Date
         $lastStatusTime = Get-Date
         $checkInterval = 300  # 5 minutes in seconds
-        $serviceCheckInterval = 1800  # 30 minutes in seconds
-        $lastServiceCheck = Get-Date
         
         # Function to display time remaining
         function Get-TimeRemaining {
@@ -371,53 +385,6 @@ jobs:
             $minutes = [math]::Floor(($remaining % 3600) / 60)
             
             return "$days days, $hours hours, $minutes minutes"
-        }
-        
-        # Function to check RDP services
-        function Check-RDPServices {
-            try {
-                $termService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-                $umRdpService = Get-Service -Name UmRdpService -ErrorAction SilentlyContinue
-                
-                $servicesOk = $true
-                
-                if ($termService -and $termService.Status -ne "Running") {
-                    Write-Warning "TermService is not running, attempting to start..."
-                    Start-Service -Name TermService -ErrorAction SilentlyContinue
-                    $servicesOk = $false
-                }
-                
-                if ($umRdpService -and $umRdpService.Status -ne "Running") {
-                    Write-Warning "UmRdpService is not running, attempting to start..."
-                    Start-Service -Name UmRdpService -ErrorAction SilentlyContinue
-                    $servicesOk = $false
-                }
-                
-                return $servicesOk
-            } catch {
-                Write-Warning "Service check failed: $($_.Exception.Message)"
-                return $false
-            }
-        }
-        
-        # Function to test RDP port
-        function Test-RDPPort {
-            try {
-                $tcpClient = New-Object System.Net.Sockets.TcpClient
-                $result = $tcpClient.BeginConnect("127.0.0.1", 3389, $null, $null)
-                $success = $result.AsyncWaitHandle.WaitOne(5000, $true)
-                
-                if ($success) {
-                    $tcpClient.EndConnect($result)
-                    $tcpClient.Close()
-                    return $true
-                } else {
-                    $tcpClient.Close()
-                    return $false
-                }
-            } catch {
-                return $false
-            }
         }
         
         while ($true) {
@@ -438,35 +405,28 @@ jobs:
                 $currentTimeStr = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 
                 Write-Host "[$currentTimeStr] RDP active - Time remaining: $timeRemaining"
-                Write-Host "Connection: $env:PUBLIC_IP:3389"
-            }
-            
-            # Check services and port every 30 minutes
-            if (($currentTime - $lastServiceCheck).TotalSeconds -ge $serviceCheckInterval) {
-                $lastServiceCheck = $currentTime
                 
-                Write-Host "Performing RDP service health check..."
-                
-                # Check services
-                $servicesOk = Check-RDPServices
-                if (-not $servicesOk) {
-                    Write-Warning "RDP services needed restart"
-                }
-                
-                # Test port
-                $portOk = Test-RDPPort
-                if (-not $portOk) {
-                    Write-Warning "RDP port test failed, checking firewall..."
-                    
-                    # Ensure firewall rules are still active
-                    netsh advfirewall firewall add rule name="RDP-Public-3389" dir=in action=allow protocol=TCP localport=3389 2>&1 | Out-Null
-                    netsh advfirewall firewall add rule name="RDP-Public-3389-UDP" dir=in action=allow protocol=UDP localport=3389 2>&1 | Out-Null
-                }
-                
-                if ($servicesOk -and $portOk) {
-                    Write-Host "✓ RDP health check passed"
-                } else {
-                    Write-Warning "RDP health check issues detected"
+                # Verify Tailscale is still connected every 30 minutes
+                if (($elapsedSeconds % 1800) -lt $checkInterval) {
+                    try {
+                        $tailscaleExe = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+                        if (Test-Path $tailscaleExe) {
+                            $tsStatus = & $tailscaleExe status --json | ConvertFrom-Json
+                            if ($tsStatus.BackendState -ne "Running") {
+                                Write-Warning "Tailscale connection lost, attempting to reconnect..."
+                                & $tailscaleExe up --reset --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+                            }
+                            
+                            # Verify IP is still valid
+                            $currentIP = & $tailscaleExe ip -4 2>&1 | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }
+                            if ($currentIP -and $currentIP -ne $env:TAILSCALE_IP) {
+                                Write-Host "Tailscale IP changed: $currentIP (was: $env:TAILSCALE_IP)"
+                                echo "TAILSCALE_IP=$currentIP" >> $env:GITHUB_ENV
+                            }
+                        }
+                    } catch {
+                        Write-Warning "Tailscale status check failed: $($_.Exception.Message)"
+                    }
                 }
             }
             
@@ -479,27 +439,5 @@ jobs:
       run: |
         Write-Host "Performing final cleanup..."
         try {
-            # Remove RDP user
-            Write-Host "Removing RDP user..."
-            Remove-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
-            
-            # Disable RDP
-            Write-Host "Disabling RDP..."
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 1 -Force -ErrorAction SilentlyContinue
-                             
-            # Remove firewall rules
-            Write-Host "Removing firewall rules..."
-            netsh advfirewall firewall delete rule name="RDP-Public-3389" 2>&1 | Out-Null
-            netsh advfirewall firewall delete rule name="RDP-Public-3389-UDP" 2>&1 | Out-Null
-            
-            # Stop RDP services
-            Write-Host "Stopping RDP services..."
-            Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
-            Stop-Service -Name UmRdpService -Force -ErrorAction SilentlyContinue
-            
-            Write-Host "Cleanup completed successfully at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-            
-        } catch {
-            Write-Warning "Cleanup encountered errors: $($_.Exception.Message)"
-        }
+            # Disconnect Tailscale if installed
+            $tailscaleExe = "${env:ProgramFiles}\Tailscale\tailscale.exe
