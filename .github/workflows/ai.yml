@@ -1,0 +1,505 @@
+name: Windows 10 RDP Direct (1 Year)
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_days:
+        description: 'Days to keep RDP active (max 365 days)'
+        required: false
+        default: '365'
+        type: string
+
+env:
+  RDP_USER: "GitHubRDPUser"
+  MAX_RETRIES: 15
+  RETRY_DELAY: 10
+
+jobs:
+  setup-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 525600  # 365 days in minutes (1 year)
+
+    steps:
+    - name: Check Windows version and network
+      run: |
+        Write-Host "Windows version:"
+        systeminfo | findstr /B /C:"OS Name" /C:"OS Version"
+        Write-Host "Network information:"
+        ipconfig | findstr IPv4
+        Write-Host "Public IP information:"
+        try {
+            $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
+            Write-Host "Public IP: $publicIP"
+            echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+        } catch {
+            Write-Host "Could not retrieve public IP"
+        }
+
+    - name: Validate and calculate timeout
+      run: |
+        $timeoutInput = '${{ github.event.inputs.timeout_days }}'
+        if ([string]::IsNullOrEmpty($timeoutInput)) {
+            $timeoutInput = "365"
+        }
+        
+        try {
+            $timeoutDays = [int]$timeoutInput
+            if ($timeoutDays -lt 1) {
+                Write-Error "Timeout days must be at least 1"
+                exit 1
+            }
+            if ($timeoutDays -gt 365) {
+                Write-Host "Warning: Maximum timeout is 365 days, setting to 365"
+                $timeoutDays = 365
+            }
+            
+            # Calculate timeout in various units
+            $timeoutHours = $timeoutDays * 24
+            $timeoutMinutes = $timeoutHours * 60
+            $timeoutSeconds = $timeoutMinutes * 60
+            
+            Write-Host "Timeout set to: $timeoutDays days ($timeoutHours hours)"
+            echo "TIMEOUT_DAYS=$timeoutDays" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            echo "TIMEOUT_HOURS=$timeoutHours" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            echo "TIMEOUT_MINUTES=$timeoutMinutes" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            echo "TIMEOUT_SECONDS=$timeoutSeconds" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            
+        } catch {
+            Write-Error "Invalid timeout value: $timeoutInput. Must be a number."
+            exit 1
+        }
+
+    - name: Configure RDP settings
+      run: |
+        function Test-Admin {
+            try {
+                $currentUser = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+                return $currentUser.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            } catch {
+                return $false
+            }
+        }
+        
+        if (-not (Test-Admin)) {
+            Write-Warning "Not running as administrator, some operations might fail"
+        }
+        
+        try {
+            Write-Host "Enabling Remote Desktop..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force -ErrorAction Stop
+                             
+            Write-Host "Configuring RDP authentication..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force -ErrorAction Stop
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force -ErrorAction Stop
+                             
+            Write-Host "Configuring RDP port..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "PortNumber" -Value 3389 -Force -ErrorAction Stop
+                             
+            Write-Host "Configuring firewall for public access..."
+            # Remove any existing rules
+            netsh advfirewall firewall delete rule name="RDP-Public-3389" 2>&1 | Out-Null
+            netsh advfirewall firewall delete rule name="RDP-Public-3389-UDP" 2>&1 | Out-Null
+            
+            # Allow RDP connections on TCP port 3389
+            netsh advfirewall firewall add rule name="RDP-Public-3389" `
+                dir=in action=allow protocol=TCP localport=3389 `
+                description="RDP Public Access TCP" 2>&1 | Out-Null
+                
+            # Allow RDP connections on UDP port 3389 (for better performance)
+            netsh advfirewall firewall add rule name="RDP-Public-3389-UDP" `
+                dir=in action=allow protocol=UDP localport=3389 `
+                description="RDP Public Access UDP" 2>&1 | Out-Null
+            
+            # Restart the Remote Desktop services
+            Write-Host "Restarting RDP services..."
+            Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
+            Stop-Service -Name UmRdpService -Force -ErrorAction SilentlyContinue
+            Start-Service -Name TermService -ErrorAction Stop
+            Start-Service -Name UmRdpService -ErrorAction Stop
+            
+            # Set services to auto-start
+            Set-Service -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
+            Set-Service -Name UmRdpService -StartupType Automatic -ErrorAction SilentlyContinue
+            
+            Write-Host "RDP configuration completed successfully"
+        } catch {
+            Write-Error "Failed to configure RDP: $($_.Exception.Message)"
+            Write-Host "Continuing despite RDP configuration error..."
+        }
+
+    - name: Create RDP user with secure password
+      run: |
+        try {
+            # Check if user already exists
+            $userExists = Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
+            if ($userExists) {
+                Write-Host "User $env:RDP_USER already exists, removing..."
+                Remove-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
+            }
+            
+            # Generate secure password without System.Web dependency
+            function Generate-SecurePassword {
+                param(
+                    [int]$Length = 20,
+                    [int]$SpecialChars = 5
+                )
+                
+                $upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                $lower = "abcdefghijklmnopqrstuvwxyz"
+                $numbers = "0123456789"
+                $special = "!@#$%^&*()_-+=[]{}|;:,.<>?/"
+                
+                $passwordChars = @()
+                
+                # Add at least one of each character type
+                $passwordChars += $upper[(Get-Random -Maximum $upper.Length)]
+                $passwordChars += $lower[(Get-Random -Maximum $lower.Length)]
+                $passwordChars += $numbers[(Get-Random -Maximum $numbers.Length)]
+                $passwordChars += $special[(Get-Random -Maximum $special.Length)]
+                
+                # Fill the rest with random characters
+                $allChars = $upper + $lower + $numbers + $special
+                for ($i = $passwordChars.Length; $i -lt $Length; $i++) {
+                    $passwordChars += $allChars[(Get-Random -Maximum $allChars.Length)]
+                }
+                
+                # Shuffle the characters
+                $shuffledChars = $passwordChars | Get-Random -Count $passwordChars.Length
+                return -join $shuffledChars
+            }
+            
+            # Generate password
+            $password = Generate-SecurePassword -Length 20 -SpecialChars 5
+            $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+            
+            # Create user
+            Write-Host "Creating user $env:RDP_USER..."
+            New-LocalUser -Name $env:RDP_USER -Password $securePassword -AccountNeverExpires -ErrorAction Stop
+            
+            Write-Host "Adding user to Administrators group..."
+            Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction Stop
+            
+            Write-Host "Adding user to Remote Desktop Users group..."
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER -ErrorAction Stop
+            
+            # Store credentials securely
+            echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+            
+            Write-Host "User $env:RDP_USER created successfully"
+            
+        } catch {
+            Write-Error "Failed to create user: $($_.Exception.Message)"
+            # Try alternative approach with simpler password
+            try {
+                Write-Host "Trying alternative user creation method..."
+                $password = "GitHubRDP@" + (Get-Date -Format "yyyyMMddHHmmss")
+                $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+                
+                New-LocalUser -Name $env:RDP_USER -Password $securePassword -AccountNeverExpires
+                Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
+                Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
+                
+                echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+                Write-Host "User created with alternative method"
+            } catch {
+                Write-Error "All user creation methods failed: $($_.Exception.Message)"
+                # Last resort - try with net user command
+                try {
+                    Write-Host "Trying net user command as last resort..."
+                    $password = "GitHubRDP$((Get-Random -Minimum 10000 -Maximum 99999))"
+                    net user $env:RDP_USER $password /add /y
+                    net localgroup Administrators $env:RDP_USER /add
+                    net localgroup "Remote Desktop Users" $env:RDP_USER /add
+                    
+                    echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+                    Write-Host "User created with net user command"
+                } catch {
+                    Write-Error "Complete failure in user creation: $($_.Exception.Message)"
+                    exit 1
+                }
+            }
+        }
+
+    - name: Get network information
+      run: |
+        Write-Host "Collecting network information..."
+        
+        # Get local IP addresses
+        $localIPs = (ipconfig | findstr IPv4) -replace ".*: " | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' }
+        Write-Host "Local IP addresses:"
+        $localIPs | ForEach-Object { Write-Host "  - $_" }
+        
+        # Get public IP
+        try {
+            $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
+            Write-Host "Public IP address: $publicIP"
+            echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+        } catch {
+            Write-Host "Could not retrieve public IP, trying alternative service..."
+            try {
+                $publicIP = Invoke-RestMethod -Uri "https://icanhazip.com" -TimeoutSec 10
+                $publicIP = $publicIP.Trim()
+                Write-Host "Public IP address: $publicIP"
+                echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+            } catch {
+                Write-Host "Failed to get public IP from alternative service"
+            }
+        }
+        
+        # Test port 3389 locally
+        Write-Host "Testing local RDP port..."
+        try {
+            $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, 3389)
+            $listener.Start()
+            $portOpen = $true
+            $listener.Stop()
+            Write-Host "Port 3389 is available locally"
+        } catch {
+            Write-Host "Port 3389 might be in use or blocked"
+        }
+
+    - name: Verify RDP service
+      run: |
+        Write-Host "Verifying RDP services..."
+        
+        # Check if RDP services are running
+        $termService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+        $umRdpService = Get-Service -Name UmRdpService -ErrorAction SilentlyContinue
+        
+        if ($termService) {
+            Write-Host "TermService status: $($termService.Status)"
+            if ($termService.Status -ne "Running") {
+                Write-Host "Starting TermService..."
+                Start-Service -Name TermService -ErrorAction SilentlyContinue
+            }
+        }
+        
+        if ($umRdpService) {
+            Write-Host "UmRdpService status: $($umRdpService.Status)"
+            if ($umRdpService.Status -ne "Running") {
+                Write-Host "Starting UmRdpService..."
+                Start-Service -Name UmRdpService -ErrorAction SilentlyContinue
+            }
+        }
+        
+        # Check firewall rules
+        Write-Host "Checking firewall rules..."
+        $firewallRules = netsh advfirewall firewall show rule name=all | findstr "RDP-Public"
+        if ($firewallRules) {
+            Write-Host "Firewall rules configured:"
+            $firewallRules | ForEach-Object { Write-Host "  - $_" }
+        } else {
+            Write-Host "No firewall rules found, configuring..."
+            netsh advfirewall firewall add rule name="RDP-Public-3389" dir=in action=allow protocol=TCP localport=3389
+            netsh advfirewall firewall add rule name="RDP-Public-3389-UDP" dir=in action=allow protocol=UDP localport=3389
+        }
+        
+        # Test RDP port locally
+        Write-Host "Testing RDP port locally..."
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $result = $tcpClient.BeginConnect("127.0.0.1", 3389, $null, $null)
+            $success = $result.AsyncWaitHandle.WaitOne(5000, $true)
+            
+            if ($success) {
+                $tcpClient.EndConnect($result)
+                $tcpClient.Close()
+                Write-Host "✓ RDP port is open locally"
+            } else {
+                $tcpClient.Close()
+                Write-Host "✗ RDP port is not responding locally"
+            }
+        } catch {
+            Write-Host "✗ Local RDP test failed: $($_.Exception.Message)"
+        }
+
+    - name: Display connection information
+      run: |
+        Write-Host "`n=============================================="
+        Write-Host "🎉 RDP DIRECT CONNECTION READY (365 DAYS) 🎉"
+        Write-Host "=============================================="
+        Write-Host "Public IP:   $env:PUBLIC_IP"
+        Write-Host "Port:        3389"
+        Write-Host "Username:    $env:RDP_USER"
+        Write-Host "Password:    $env:RDP_PASSWORD"
+        Write-Host "=============================================="
+        Write-Host "Duration:    $env:TIMEOUT_DAYS days"
+        Write-Host "Started:     $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Write-Host "Ends:        $((Get-Date).AddDays($env:TIMEOUT_DAYS).ToString('yyyy-MM-dd HH:mm:ss'))"
+        Write-Host "=============================================="
+        
+        # Display local IPs for additional connectivity options
+        Write-Host "`nLocal IP addresses (if needed):"
+        ipconfig | findstr IPv4 | ForEach-Object { 
+            $ip = $_ -replace ".*: "
+            Write-Host "  - $ip:3389"
+        }
+        
+        Write-Host "`nConnection string examples:"
+        Write-Host "  - mstsc /v:$env:PUBLIC_IP:3389"
+        Write-Host "  - Remote Desktop Connection -> $env:PUBLIC_IP:3389"
+        
+        Write-Host "=============================================="
+        Write-Host "⚠️  IMPORTANT: This RDP is publicly accessible!"
+        Write-Host "Use a strong password and be cautious."
+        Write-Host "==============================================`n"
+
+    - name: Maintain RDP connection (1 Year - Direct)
+      run: |
+        Write-Host "Starting 1-year RDP maintenance session (Direct Connection)..."
+        Write-Host "Timeout: $env:TIMEOUT_DAYS days ($env:TIMEOUT_HOURS hours)"
+        Write-Host "Public IP: $env:PUBLIC_IP:3389"
+        
+        $startTime = Get-Date
+        $lastStatusTime = Get-Date
+        $checkInterval = 300  # 5 minutes in seconds
+        $serviceCheckInterval = 1800  # 30 minutes in seconds
+        $lastServiceCheck = Get-Date
+        
+        # Function to display time remaining
+        function Get-TimeRemaining {
+            param($elapsedSeconds, $totalSeconds)
+            if ($totalSeconds -eq 0) { return "Unlimited" }
+            
+            $remaining = $totalSeconds - $elapsedSeconds
+            $days = [math]::Floor($remaining / 86400)
+            $hours = [math]::Floor(($remaining % 86400) / 3600)
+            $minutes = [math]::Floor(($remaining % 3600) / 60)
+            
+            return "$days days, $hours hours, $minutes minutes"
+        }
+        
+        # Function to check RDP services
+        function Check-RDPServices {
+            try {
+                $termService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+                $umRdpService = Get-Service -Name UmRdpService -ErrorAction SilentlyContinue
+                
+                $servicesOk = $true
+                
+                if ($termService -and $termService.Status -ne "Running") {
+                    Write-Warning "TermService is not running, attempting to start..."
+                    Start-Service -Name TermService -ErrorAction SilentlyContinue
+                    $servicesOk = $false
+                }
+                
+                if ($umRdpService -and $umRdpService.Status -ne "Running") {
+                    Write-Warning "UmRdpService is not running, attempting to start..."
+                    Start-Service -Name UmRdpService -ErrorAction SilentlyContinue
+                    $servicesOk = $false
+                }
+                
+                return $servicesOk
+            } catch {
+                Write-Warning "Service check failed: $($_.Exception.Message)"
+                return $false
+            }
+        }
+        
+        # Function to test RDP port
+        function Test-RDPPort {
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $result = $tcpClient.BeginConnect("127.0.0.1", 3389, $null, $null)
+                $success = $result.AsyncWaitHandle.WaitOne(5000, $true)
+                
+                if ($success) {
+                    $tcpClient.EndConnect($result)
+                    $tcpClient.Close()
+                    return $true
+                } else {
+                    $tcpClient.Close()
+                    return $false
+                }
+            } catch {
+                return $false
+            }
+        }
+        
+        while ($true) {
+            $currentTime = Get-Date
+            $elapsedSeconds = ($currentTime - $startTime).TotalSeconds
+            
+            # Check if timeout reached
+            if ($env:TIMEOUT_SECONDS -ne "0" -and $elapsedSeconds -ge $env:TIMEOUT_SECONDS) {
+                Write-Host "RDP session timeout reached. Shutting down."
+                break
+            }
+            
+            # Display status every 5 minutes
+            if (($currentTime - $lastStatusTime).TotalSeconds -ge $checkInterval) {
+                $lastStatusTime = $currentTime
+                
+                $timeRemaining = Get-TimeRemaining $elapsedSeconds $env:TIMEOUT_SECONDS
+                $currentTimeStr = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                
+                Write-Host "[$currentTimeStr] RDP active - Time remaining: $timeRemaining"
+                Write-Host "Connection: $env:PUBLIC_IP:3389"
+            }
+            
+            # Check services and port every 30 minutes
+            if (($currentTime - $lastServiceCheck).TotalSeconds -ge $serviceCheckInterval) {
+                $lastServiceCheck = $currentTime
+                
+                Write-Host "Performing RDP service health check..."
+                
+                # Check services
+                $servicesOk = Check-RDPServices
+                if (-not $servicesOk) {
+                    Write-Warning "RDP services needed restart"
+                }
+                
+                # Test port
+                $portOk = Test-RDPPort
+                if (-not $portOk) {
+                    Write-Warning "RDP port test failed, checking firewall..."
+                    
+                    # Ensure firewall rules are still active
+                    netsh advfirewall firewall add rule name="RDP-Public-3389" dir=in action=allow protocol=TCP localport=3389 2>&1 | Out-Null
+                    netsh advfirewall firewall add rule name="RDP-Public-3389-UDP" dir=in action=allow protocol=UDP localport=3389 2>&1 | Out-Null
+                }
+                
+                if ($servicesOk -and $portOk) {
+                    Write-Host "✓ RDP health check passed"
+                } else {
+                    Write-Warning "RDP health check issues detected"
+                }
+            }
+            
+            # Sleep for 1 minute
+            Start-Sleep -Seconds 60
+        }
+
+    - name: Cleanup (on cancellation or completion)
+      if: always()
+      run: |
+        Write-Host "Performing final cleanup..."
+        try {
+            # Remove RDP user
+            Write-Host "Removing RDP user..."
+            Remove-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
+            
+            # Disable RDP
+            Write-Host "Disabling RDP..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 1 -Force -ErrorAction SilentlyContinue
+                             
+            # Remove firewall rules
+            Write-Host "Removing firewall rules..."
+            netsh advfirewall firewall delete rule name="RDP-Public-3389" 2>&1 | Out-Null
+            netsh advfirewall firewall delete rule name="RDP-Public-3389-UDP" 2>&1 | Out-Null
+            
+            # Stop RDP services
+            Write-Host "Stopping RDP services..."
+            Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
+            Stop-Service -Name UmRdpService -Force -ErrorAction SilentlyContinue
+            
+            Write-Host "Cleanup completed successfully at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            
+        } catch {
+            Write-Warning "Cleanup encountered errors: $($_.Exception.Message)"
+        }
